@@ -1,0 +1,75 @@
+name: Sync notes mirror
+
+# Runs daily and on demand. Copies the notes from the source repo, redacts YouTube links that sit
+# inside a "Links" section, then replaces the public mirror with ONE fresh commit by github-actions[bot].
+# The old history is deleted every run, so no earlier contributor appears in the mirror.
+
+on:
+  schedule:
+    - cron: "0 * * * *"          # daily, 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read                  # this workflow only reads itself; the push uses ANON_PAT
+
+concurrency:
+  group: notes-mirror-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the app repo (scripts only)
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the notes from Google Drive (read-only)
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          DRIVE_REFRESH_TOKEN: ${{ secrets.DRIVE_REFRESH_TOKEN }}       # drive.readonly scope only
+          DRIVE_NOTES_FOLDER_ID: ${{ secrets.DRIVE_NOTES_FOLDER_ID }}   # the notes folder's ID
+        run: |
+          set -euo pipefail
+          pip install -q google-api-python-client google-auth
+          python3 app/scripts/drive_fetch.py source
+
+      - name: Sanitize and build the mirror
+        env:
+          NOTES_OUT: ${{ runner.temp }}/mirror
+        run: python3 app/scripts/sanitize_sync.py source/ "$NOTES_OUT"
+
+      - name: Replace the mirror with a single bot commit (force push)
+        env:
+          ANON_PAT: ${{ secrets.ANON_PAT }}
+          ANON_REPO_PATH: ${{ secrets.ANON_REPO_PATH }}     # owner/name of the public mirror repo
+          NOTES_OUT: ${{ runner.temp }}/mirror
+        run: |
+          set -euo pipefail
+          test -n "$ANON_PAT" && test -n "$ANON_REPO_PATH"
+
+          # 1) Copy the app files that the Pages site needs, next to the notes.
+          cp app/index.html app/app.js app/sw.js app/manifest.json app/icon-*.png app/README.md "$NOTES_OUT"/
+          cp -r app/scripts "$NOTES_OUT"/scripts
+          mkdir -p "$NOTES_OUT"/.github && cp -r app/.github/workflows "$NOTES_OUT"/.github/workflows   # keep the sync itself in the mirror
+
+          # 2) Throw away every trace of the previous history: a brand-new repo, one commit.
+          cd "$NOTES_OUT"
+          rm -rf .git
+          git init -q -b main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Sync notes mirror"
+          git remote add origin "https://x-access-token:${ANON_PAT}@github.com/${ANON_REPO_PATH}.git"
+
+          # 3) Overwrite the remote history completely.
+          git push --force origin main
+          echo "Mirror updated with one commit."
